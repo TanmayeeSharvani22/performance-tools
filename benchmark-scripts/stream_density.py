@@ -14,6 +14,7 @@ import re
 import statistics
 import psutil
 import json
+import math
 
 # Constants:
 TARGET_FPS_KEY = "TARGET_FPS"
@@ -27,10 +28,8 @@ CONSECUTIVE_FAIL_WINDOWS_KEY = "CONSECUTIVE_FAIL_WINDOWS"
 CONSECUTIVE_PASS_WINDOWS_KEY = "CONSECUTIVE_PASS_WINDOWS"
 DEFAULT_CONSECUTIVE_FAIL_WINDOWS = 2
 DEFAULT_CONSECUTIVE_PASS_WINDOWS = 2
-FPS_SAMPLE_WINDOW_KEY = "FPS_SAMPLE_WINDOW"
 HYSTERESIS_FPS_KEY = "HYSTERESIS_FPS"
 PASS_TOLERANCE_RATIO_KEY = "PASS_TOLERANCE_RATIO"
-DEFAULT_FPS_SAMPLE_WINDOW = 60
 DEFAULT_HYSTERESIS_FPS = 0.10
 DEFAULT_PASS_TOLERANCE_RATIO = 0.95
 CAMERA_STREAM_KEY = "CAMERA_STREAM"
@@ -357,16 +356,59 @@ def get_latest_pipeline_logs(num_pipelines, pipeline_log_files):
     return latest_files
 
 
-def get_fps_sample_window(env_vars=None):
-    sample_window = DEFAULT_FPS_SAMPLE_WINDOW
-    if env_vars:
-        sample_window = int(env_vars.get(FPS_SAMPLE_WINDOW_KEY, sample_window))
-    if sample_window <= 0:
-        raise ArgumentError('ERROR: FPS sample window should be greater than 0')
-    return sample_window
+def detect_steady_state(numeric_fps, target_cv_ratio=0.05, rolling_window=20, min_consecutive=3):
+    """
+    Detect steady-state in FPS samples using rolling coefficient of variation (CV).
+    
+    Steady-state = period where CV < target_cv_ratio consistently.
+    
+    Args:
+        numeric_fps: List of FPS samples in time order
+        target_cv_ratio: Coefficient of Variation threshold (lower = more stable)
+        rolling_window: Window size for rolling CV calculation
+        min_consecutive: Require N consecutive windows below threshold
+    
+    Returns:
+        Tuple: (steady_state_start_idx, confidence_score, is_detected)
+    """
+    if len(numeric_fps) < rolling_window:
+        return 0, 0.0, False
+    
+    rolling_cvs = []
+    for i in range(len(numeric_fps) - rolling_window + 1):
+        window = numeric_fps[i:i+rolling_window]
+        mean_val = statistics.mean(window)
+        if mean_val <= 0:
+            rolling_cvs.append(float('inf'))
+            continue
+        stdev_val = statistics.stdev(window) if len(window) > 1 else 0
+        cv = stdev_val / mean_val
+        rolling_cvs.append(cv)
+    
+    # Find first window where CV stays below threshold for min_consecutive windows
+    for idx in range(len(rolling_cvs) - min_consecutive + 1):
+        window_cvs = rolling_cvs[idx:idx+min_consecutive]
+        if all(c < target_cv_ratio for c in window_cvs):
+            steady_idx = idx
+            avg_cv = statistics.mean(window_cvs)
+            confidence = max(0.0, 1.0 - (avg_cv / target_cv_ratio))
+            return steady_idx, confidence, True
+    
+    return 0, 0.0, False
 
 
-def extract_numeric_fps(file_path):
+def extract_numeric_fps(file_path, discard_warm_up_ratio=0.30, detect_steady=True):
+    """
+    Extract numeric FPS from log file with warm-up discard and optional steady-state detection.
+    
+    Args:
+        file_path: Path to FPS log file
+        discard_warm_up_ratio: Fraction of early samples to discard as warm-up (default 30%)
+        detect_steady: Use variance-based steady-state detection (industry standard)
+    
+    Returns:
+        Tuple: (numeric_fps_filtered, discard_count, steady_idx, is_steady_detected)
+    """
     with open(file_path, "r") as file:
         lines = file.readlines()
 
@@ -380,7 +422,27 @@ def extract_numeric_fps(file_path):
         except ValueError:
             print(f"DEBUG: Skipping non-numeric line '{stripped_line}' in {file_path}")
 
-    return numeric_fps
+    if not numeric_fps:
+        return [], 0, 0, False
+    
+    # --- Warm-up discard: remove first 30% ---
+    warm_up_count = max(1, int(len(numeric_fps) * discard_warm_up_ratio))
+    fps_after_discard = numeric_fps[warm_up_count:]
+    
+    if os.getenv("STREAM_DENSITY_DEBUG", "0") == "1":
+        print(f"DEBUG: Discarded {warm_up_count}/{len(numeric_fps)} warm-up samples ({discard_warm_up_ratio*100}%)")
+    
+    # --- Steady-state detection: find where variance stabilizes ---
+    steady_idx = 0
+    is_steady_detected = False
+    if detect_steady and len(fps_after_discard) >= 20:
+        steady_idx, confidence, is_detected = detect_steady_state(fps_after_discard)
+        is_steady_detected = is_detected
+        if is_detected:
+            if os.getenv("STREAM_DENSITY_DEBUG", "0") == "1":
+                print(f"DEBUG: Steady-state detected at sample {steady_idx} (confidence={confidence:.2f})")
+    
+    return fps_after_discard, warm_up_count, steady_idx, is_steady_detected
 
 
 def filter_logs_for_current_timestamp(log_files):
@@ -543,11 +605,6 @@ def validate_and_setup_env(env_vars, target_fps_list):
         raise ArgumentError(
             'ERROR: consecutive pass windows should be greater than 0')
 
-    if is_env_non_empty(env_vars, FPS_SAMPLE_WINDOW_KEY) and int(
-            env_vars[FPS_SAMPLE_WINDOW_KEY]) <= 0:
-        raise ArgumentError(
-            'ERROR: FPS sample window should be greater than 0')
-
     if is_env_non_empty(env_vars, HYSTERESIS_FPS_KEY) and float(
             env_vars[HYSTERESIS_FPS_KEY]) < 0.0:
         raise ArgumentError(
@@ -671,13 +728,15 @@ def run_pipeline_iterations(
         # once we have all non-empty pipeline log files
         # we then can calculate the average fps
         # --- Calculate FPS and latency metrics ---
-        total_fps, total_fps_per_stream, stream_fps_dict = calculate_multi_stream_fps(
+        total_fps, min_p90_across_streams, stream_fps_dict = calculate_multi_stream_fps(
             num_pipelines, results_dir, container_name, env_vars)
 
         print('container name:', container_name)
         print('Total FPS:', total_fps)
         print('stream_fps_dict:', stream_fps_dict)
-        print(f"Total averaged FPS per stream: {total_fps_per_stream} "
+        # Calculate average p90 across all streams
+        avg_p90_per_stream = statistics.mean([v for v in stream_fps_dict.values() if float(v) > 0]) if stream_fps_dict.values() else 0.0
+        print(f"Averaged FPS per stream (mean p90): {avg_p90_per_stream} "
               f"for {num_pipelines} pipeline(s)")
         
         total_pipeline_latency, total_pipeline_latency_per_stream = calculate_pipeline_latency(
@@ -728,16 +787,18 @@ def run_pipeline_iterations(
                     increments = int(env_vars[PIPELINE_INCR_KEY])
                 else:
                     per_stream_values = list(stream_fps_dict.values())
-                    robust_per_stream = statistics.median(per_stream_values) if per_stream_values else total_fps_per_stream
-                    conservative_per_stream = min(total_fps_per_stream, robust_per_stream)
+                    robust_per_stream = statistics.median(per_stream_values) if per_stream_values else min_p90_across_streams
+                    conservative_per_stream = min(min_p90_across_streams, robust_per_stream)
                     average_target_fps = get_mean_target_fps(stream_target_fps, target_fps)
                     if os.getenv("STREAM_DENSITY_DEBUG", "0") == "1":
                         print('mean target fps:', average_target_fps)
                     increments = int(conservative_per_stream / average_target_fps)
-                    if increments <= 0:
-                        increments = 1
-                    if increments == 1:
-                        increments = MAX_GUESS_INCREMENTS
+                    min_increment = 1
+                    max_increment = MAX_GUESS_INCREMENTS
+                    if increments <= 1:
+                        increments = max_increment
+                    else:
+                        increments = min(increments, max_increment)
                 print(
                     f"✅ All streams meet pass thresholds {pass_thresholds} "
                     f"for target FPS map {stream_target_fps}. "
@@ -944,12 +1005,21 @@ def run_stream_density(env_vars, compose_files, target_fps_list,
 
 def calculate_multi_stream_fps(num_pipelines, results_dir, container_name, env_vars=None):
     """
-    Calculates averaged FPS per stream for all matching log files named pipeline_stream<idx>*.log.
+    Calculates reporting and decision FPS metrics per stream from
+    log files named pipeline_stream<idx>*.log.
+
+    Reporting metric:
+        - total_fps: sum of per-stream average FPS values.
+
+    Decision metrics:
+        - stream_fps_dict: per-stream p90 FPS (minimum p90 across files for each stream).
+        - min_p90_across_streams: minimum p90 across all streams (bottleneck performance).
+
     Each stream index is handled independently.
     Returns:
-        total_fps: sum of per-stream averaged FPS
-        total_fps_per_stream: average FPS across all streams
-        stream_fps_dict: filename -> averaged FPS
+        total_fps: sum of per-stream average FPS (reporting)
+        min_p90_across_streams: minimum p90 across all streams (decision)
+        stream_fps_dict: stream -> minimum p90 FPS across matching files
     """
 
     stream_count = get_pipeline_stream_count()
@@ -957,7 +1027,6 @@ def calculate_multi_stream_fps(num_pipelines, results_dir, container_name, env_v
     # --- Initialize accumulators ---
     total_fps = 0.0
     stream_fps_dict = {}
-    sample_window = get_fps_sample_window(env_vars)
     time.sleep(10)  # Ensure logs are fully written
     
     # --- Loop over all streams ---
@@ -980,42 +1049,66 @@ def calculate_multi_stream_fps(num_pipelines, results_dir, container_name, env_v
             continue
 
         # --- Process all matching log files for this stream ---
-        stream_avg_sum = 0.0
+        stream_fps_sum = 0.0
+        stream_sample_count = 0
+        stream_min_p90 = None
 
         for pipeline_file in latest_pipeline_logs:
             print(f"DEBUG: Processing file: {pipeline_file}")
             try:
-                numeric_fps = extract_numeric_fps(pipeline_file)
+                # Extract FPS with warm-up discard and steady-state detection
+                fps_data, warm_up_discarded, steady_idx, is_steady = extract_numeric_fps(
+                    pipeline_file, discard_warm_up_ratio=0.30, detect_steady=True
+                )
 
-                if not numeric_fps:
+                if not fps_data:
                     print(f"WARN: No numeric FPS entries for {pipeline_file}")
                     continue
-                file_name = os.path.basename(pipeline_file)
-                stream_fps_avg = sum(numeric_fps) / len(numeric_fps)
-                stream_fps_median = statistics.median(numeric_fps)
-                stream_avg_sum += stream_fps_avg
-                stream_fps_dict[f'pipeline_stream{idx}'] = round(stream_fps_median, 2)
+                
+                # Use only steady-state portion (or all if steady not detected)
+                if is_steady:
+                    measurement_fps = fps_data[steady_idx:]
+                else:
+                    measurement_fps = fps_data
+                
+                if not measurement_fps:
+                    print(f"WARN: No steady-state data for {pipeline_file}")
+                    continue
+                
+                stream_fps_sum += sum(measurement_fps)
+                stream_sample_count += len(measurement_fps)
+                sorted_fps = sorted(measurement_fps)
+                # Industry-standard p90 (90th percentile) using nearest-rank method with proper rounding
+                # Fixes small-sample bias in floor-based calculation
+                p90_idx = min(math.ceil(0.9 * len(sorted_fps)) - 1, len(sorted_fps) - 1)
+                stream_fps_p90 = sorted_fps[p90_idx]
+                if stream_min_p90 is None or stream_fps_p90 < stream_min_p90:
+                    stream_min_p90 = stream_fps_p90
 
-                print(f"INFO: Averaged FPS for {pipeline_file}: {stream_fps_avg}")
-                print(f"INFO: Median FPS for {pipeline_file}: {stream_fps_median}")
+                if os.getenv("STREAM_DENSITY_DEBUG", "0") == "1":
+                    print(f"INFO: P90 FPS for {pipeline_file}: {stream_fps_p90} (samples={len(measurement_fps)}, warm_up_discarded={warm_up_discarded}, steady_detected={is_steady})")
+                else:
+                    print(f"INFO: P90 FPS for {pipeline_file}: {stream_fps_p90}")
 
             except (IOError, OSError) as e:
                 print(f"WARN: Read error on {pipeline_file}: {e}")
         
-        # --- Compute average across all files for this stream index ---
-        if num_pipelines > 0:
-            final_stream_avg = stream_avg_sum
-            if f'pipeline_stream{idx}' not in stream_fps_dict:
-                stream_fps_dict[f'pipeline_stream{idx}'] = 0.0
-            total_fps += final_stream_avg
+        # --- Compute reporting average and decision p90 for this stream index ---
+        if num_pipelines > 0 and stream_sample_count > 0:
+            report_stream_avg = stream_fps_sum / stream_sample_count
+            total_fps += report_stream_avg
+            stream_fps_dict[f'pipeline_stream{idx}'] = round(stream_min_p90, 2)
         else:
             stream_fps_dict[f'pipeline_stream{idx}'] = 0.0
             print(f"WARN: No valid FPS data for stream index {idx}")
 
-    # --- Compute total and per-stream averages ---
-    total_fps_per_stream = total_fps / stream_count if stream_count > 0 else 0.0
+    # --- Decision metric: bottleneck p90 across all streams ---
+    decision_stream_p90 = [
+        float(v) for v in stream_fps_dict.values() if float(v) > 0
+    ]
+    min_p90_across_streams = min(decision_stream_p90) if decision_stream_p90 else 0.0
 
-    return total_fps, total_fps_per_stream, stream_fps_dict
+    return total_fps, min_p90_across_streams, stream_fps_dict
 
 
 def get_pipeline_stream_count(base_dir=None):
@@ -1078,7 +1171,7 @@ def get_latest_pipeline_stream_logs(num_pipelines, pipeline_log_files):
         (file, os.path.getmtime(file)) for file in pipeline_log_files]
     # sort timestamp_file by time in descending order
     sorted_timestamp = sorted(
-        timestamp_files, key=lambda x: x[1], reverse=False)
+        timestamp_files, key=lambda x: x[1], reverse=True)
     latest_files = [
         file for file, mtime in sorted_timestamp[:num_pipelines]]
     return latest_files
