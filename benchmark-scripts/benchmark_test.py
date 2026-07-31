@@ -9,6 +9,8 @@ import subprocess  # nosec B404
 import unittest
 import benchmark
 import os
+import argparse
+from device_validation import validate_target_device
 
 
 class Testing(unittest.TestCase):
@@ -54,6 +56,28 @@ class Testing(unittest.TestCase):
         self.assertEqual(res, ('', 'an error occurred', 1))
         mock_popen.communicate.assert_called_once_with()
         mock_returncode.assert_called()
+
+    def test_validate_target_device_valid_values(self):
+        test_cases = {
+            'CPU': 'CPU',
+            'GPU': 'GPU',
+            'GPU.0': 'GPU.0',
+            'GPU.1': 'GPU.1',
+            'GPU.2': 'GPU.2',
+            'NPU': 'NPU',
+        }
+
+        for user_value, expected in test_cases.items():
+            with self.subTest(user_value=user_value):
+                self.assertEqual(validate_target_device(user_value), expected)
+
+    def test_validate_target_device_invalid_values(self):
+        invalid_values = ['GPU.', 'GPU.A', 'GPU.-1', 'GPU.abc']
+
+        for user_value in invalid_values:
+            with self.subTest(user_value=user_value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    validate_target_device(user_value)
 
 
 if __name__ == '__main__':
