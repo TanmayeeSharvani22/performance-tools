@@ -3,6 +3,7 @@ Utilities for validating benchmark target device arguments.
 """
 
 import argparse
+import os
 import re
 
 
@@ -32,3 +33,17 @@ def validate_target_device(value: str) -> str:
         "invalid target device '%s'. Expected one of: CPU, GPU, NPU, GPU.<index>"
         % value
     )
+
+
+def resolve_target_device_default(default_value: str,
+                                  env_var_name: str = "TARGET_DEVICE") -> str:
+    """Resolve default target device using env var and validate/normalize it.
+
+    Precedence:
+    1) explicit CLI value (handled by argparse separately)
+    2) environment variable
+    3) hard-coded default
+    """
+    env_value = os.getenv(env_var_name)
+    candidate = env_value if env_value and env_value.strip() else default_value
+    return validate_target_device(candidate)

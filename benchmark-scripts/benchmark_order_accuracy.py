@@ -25,7 +25,7 @@ import csv
 import traceback
 from pathlib import Path
 from typing import List, Dict, Optional
-from device_validation import validate_target_device
+from device_validation import validate_target_device, resolve_target_device_default
 
 # Import from performance-tools benchmark scripts
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -687,10 +687,15 @@ For stream density testing, use application-specific scripts:
         help='Directory for results output'
     )
     
+    try:
+        default_target_device = resolve_target_device_default('GPU')
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+
     parser.add_argument(
         '--target_device',
         type=validate_target_device,
-        default='GPU',
+        default=default_target_device,
         help='Target inference device [CPU|GPU|GPU.<index>|NPU]'
     )
     
