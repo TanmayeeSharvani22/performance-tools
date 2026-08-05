@@ -163,6 +163,25 @@ def _set_stream_density(app_dir: str, density: int) -> None:
 # Helpers – docker compose
 # ---------------------------------------------------------------------------
 
+def _wait_for_ovms_ready(timeout: int = 180, poll_interval: int = 5) -> None:
+    """Block until OVMS reports all models ready via its health endpoint."""
+    import urllib.request
+    import urllib.error
+    url = "http://localhost:9000/v2/health/ready"
+    deadline = time.monotonic() + timeout
+    logger.info("Polling OVMS readiness at %s (timeout %ds) …", url, timeout)
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                if resp.status == 200:
+                    logger.info("OVMS is ready")
+                    return
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+    logger.warning("OVMS did not become ready after %ds — continuing anyway", timeout)
+
+
 def _compose_cmd(app_dir: str) -> str:
     """Build the base ``docker compose`` invocation matching the main Makefile."""
     scenescape_dir = str(Path(app_dir) / ".." / "scenescape")
@@ -177,6 +196,19 @@ def _compose_cmd(app_dir: str) -> str:
         f"-f {shlex.quote(scenescape_compose)}",
         f"-f {shlex.quote(lp_compose)}",
     ]
+    # Mirror the Makefile: include the NPU device-mapping override when the
+    # active resource config enables any NPU device (DETECT_DEVICE or REID_DEVICE).
+    resource_config = os.environ.get("RESOURCE_CONFIG",
+                                     os.path.join(app_dir, "configs", "res", "all-gpu-cpu.env"))
+    npu_override = os.path.join(app_dir, "docker", "docker-compose.npu.yaml")
+    if os.path.isfile(npu_override) and os.path.isfile(resource_config):
+        try:
+            with open(resource_config) as _rc:
+                _rc_text = _rc.read()
+            if re.search(r'^(DETECT_DEVICE|REID_DEVICE)=NPU$', _rc_text, re.MULTILINE):
+                parts.append(f"-f {shlex.quote(npu_override)}")
+        except OSError:
+            pass
     # Layer in cameras override if it exists
     cameras_override = os.path.join(app_dir, "docker", "docker-compose.cameras.yaml")
     if os.path.isfile(cameras_override):
@@ -360,14 +392,47 @@ def _generate_dlstreamer_config(app_dir: str, num_scenes: int) -> None:
     """
     scenescape_dir = Path(app_dir) / ".." / "scenescape"
     app_name = Path(app_dir).name
-    output_path = scenescape_dir / "dlstreamer-pipeline-server" / f"{app_name}-pipeline-config.json"
 
     base = _read_base_config(app_dir)
     base_camera = base["camera_name"]
 
+    # Resolve the rendered config path that init.sh generated.
+    # Preferred source: PIPELINE_CONFIG in app docker/.env.
+    # Fallbacks keep compatibility with older naming conventions.
+    env_file = Path(app_dir) / "docker" / ".env"
+    output_path: Optional[Path] = None
+    if env_file.exists():
+        try:
+            for line in env_file.read_text().splitlines():
+                if line.startswith("PIPELINE_CONFIG="):
+                    cfg_path = line.split("=", 1)[1].strip()
+                    if cfg_path:
+                        candidate = Path(cfg_path)
+                        if candidate.exists():
+                            output_path = candidate
+                    break
+        except OSError:
+            pass
+
+    if output_path is None:
+        legacy = scenescape_dir / "dlstreamer-pipeline-server" / f"{app_name}-pipeline-config.json"
+        camera_specific = scenescape_dir / "dlstreamer-pipeline-server" / f"{app_name}-{base_camera}-pipeline-config.json"
+        if legacy.exists():
+            output_path = legacy
+        elif camera_specific.exists():
+            output_path = camera_specific
+        else:
+            matches = sorted((scenescape_dir / "dlstreamer-pipeline-server").glob(f"{app_name}-*-pipeline-config.json"))
+            if matches:
+                output_path = matches[0]
+
     # Read the rendered config that init.sh just produced (all {{VAR}} resolved)
-    if not output_path.exists():
-        logger.error("Rendered DLStreamer config not found at %s — did init.sh run?", output_path)
+    if output_path is None or not output_path.exists():
+        logger.error(
+            "Rendered DLStreamer config not found under %s for app '%s' — did init.sh run?",
+            scenescape_dir / "dlstreamer-pipeline-server",
+            app_name,
+        )
         return
 
     with open(output_path) as fh:
@@ -737,6 +802,8 @@ class SADStreamDensity:
         self.single_run = single_run
         self.single_run_scenes = single_run_scenes
         self.min_throughput_ratio = min_throughput_ratio
+        # Minimum VLM file pairs required before a latency reading is trusted.
+        self.min_vlm_samples = 3
         os.makedirs(self.results_dir, exist_ok=True)
 
     # ---- public API -------------------------------------------------------
@@ -760,9 +827,7 @@ class SADStreamDensity:
             if iteration == 1:
                 logger.info("Restarting behavioral-analysis and ovms-vlm for clean memory baseline …")
                 _docker_compose(self.app_dir, "restart ovms-vlm")
-                # Wait for OVMS model to load
-                logger.info("Waiting 60s for OVMS model to load …")
-                time.sleep(60)
+                _wait_for_ovms_ready()
                 _docker_compose(self.app_dir, "restart behavioral-analysis")
                 logger.info("Waiting 30s for BA to initialise …")
                 time.sleep(30)
@@ -787,11 +852,13 @@ class SADStreamDensity:
 
             # Throughput: compare actual samples to expected
             actual_samples = int(stats.get("e2e_latency_count", 0))
-            # Baseline: ~12 samples per scene per 30s collection window
-            if not hasattr(self, '_baseline_rate'):
-                self._baseline_rate = max(actual_samples, 1)
-            expected_samples = num_scenes * self._baseline_rate
-            throughput_ratio = actual_samples / expected_samples if expected_samples > 0 else 1.0
+            # Defer baseline until the first iteration that produces real samples;
+            # setting it from a zero-sample scene 1 would corrupt all later ratios.
+            if not hasattr(self, '_baseline_rate') and actual_samples > 0:
+                self._baseline_rate = actual_samples
+            _rate = getattr(self, '_baseline_rate', None)
+            expected_samples = num_scenes * _rate if _rate is not None else 0
+            throughput_ratio = actual_samples / expected_samples if expected_samples > 0 else 0.0
             samples_per_scene = actual_samples / num_scenes if num_scenes > 0 else 0
 
             it_result = IterationResult(
@@ -809,20 +876,35 @@ class SADStreamDensity:
 
             self._print_iteration(it_result)
 
-            # Pass/fail: based on latency only
-            latency_ok = latency > 0 and latency <= self.target_latency_ms
+            # Insufficient data: retry the same scene count (don't advance).
+            # Requires both a non-zero latency reading AND enough e2e samples
+            # to be statistically meaningful; zero-sample readings are not trusted.
+            if latency == 0 or actual_samples < self.min_vlm_samples:
+                print(f"  ⚠ INSUFFICIENT DATA (e2e_samples={actual_samples}, "
+                      f"min={self.min_vlm_samples}) – retrying same scene count")
+                logger.warning("Insufficient samples at %d scene(s); not advancing.",
+                               num_scenes)
+                continue
 
-            if latency == 0:
-                print("  ⚠ NO DATA – no latency metrics collected yet")
-                if iteration > 1:
-                    break
-            elif latency_ok:
+            # Pass/fail: latency must be within threshold AND throughput must be healthy.
+            latency_ok = latency > 0 and latency <= self.target_latency_ms
+            # Only enforce throughput gate when a baseline has been established.
+            _rate = getattr(self, '_baseline_rate', None)
+            throughput_ok = _rate is None or throughput_ratio >= self.min_throughput_ratio
+
+            if latency_ok and throughput_ok:
                 it_result.passed = True
                 best = it_result
                 print(f"  ✓ PASSED  (latency={latency:.0f}ms, throughput={throughput_ratio:.0%})")
-            else:
+            elif not latency_ok:
                 it_result.passed = False
                 print(f"  ✗ FAILED  (latency {latency:.0f}ms > {self.target_latency_ms:.0f}ms)")
+                result.iterations.append(it_result)
+                break
+            else:
+                it_result.passed = False
+                print(f"  ✗ FAILED  (throughput {throughput_ratio:.0%} < "
+                      f"min {self.min_throughput_ratio:.0%})")
                 result.iterations.append(it_result)
                 break
 
