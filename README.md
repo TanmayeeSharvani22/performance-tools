@@ -7,6 +7,32 @@
 - [Open source code for setup, install, and execution of software, with complete developer documentation](https://intel-retail.github.io/documentation/performance-tools/benchmark.html)
 - [Developer focused website to enable developers to engage and build our partner community](https://www.intel.com/content/www/us/en/developer/articles/reference-implementation/automated-self-checkout.html)
 
+## Benchmark Target Device
+
+Benchmark scripts support explicit target-device selection via `--target_device` or `TARGET_DEVICE`.
+
+Accepted values:
+
+- `CPU`
+- `GPU`
+- `GPU.<index>` (for example: `GPU.0`, `GPU.1`, `GPU.2`)
+- `NPU`
+
+Examples:
+
+```bash
+# Existing workflow (still supported)
+make benchmark TARGET_DEVICE=GPU
+
+# Explicit GPU device selection
+make benchmark TARGET_DEVICE=GPU.1
+
+# Direct script usage
+python benchmark-scripts/benchmark.py \
+	--compose_file ./docker/docker-compose.yaml \
+	--target_device GPU.1
+```
+
 ## Disclaimer
 
 GStreamer is an open source framework licensed under LGPL. See https://gstreamer.freedesktop.org/documentation/frequently-asked-questions/licensing.html?gi-language=c.  You are solely responsible for determining if your use of Gstreamer requires any additional licenses.  Intel is not responsible for obtaining any such licenses, nor liable for any licensing fees due, in connection with your use of Gstreamer

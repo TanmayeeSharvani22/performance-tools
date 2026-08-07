@@ -14,7 +14,7 @@ plot: init-packages
 	python3 usage_graph_plot.py --dir $(ROOT_DIRECTORY)/
 
 python-test:
-	python -m coverage run -m unittest benchmark_test.py stream_density_test.py
+	python -m coverage run -m unittest benchmark_test.py stream_density_test.py device_validation_test.py
 
 python-integration:
 	python -m coverage run -m unittest benchmark_integration.py

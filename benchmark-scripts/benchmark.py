@@ -13,6 +13,7 @@ import traceback
 import csv
 import json
 import stream_density
+from device_validation import validate_target_device, resolve_target_device_default
 
 
 def parse_args(print=False):
@@ -76,8 +77,13 @@ def parse_args(print=False):
                         help='initial time in seconds before ' +
                              'starting metric data collection')
     # TODO: change target_device to an env variable in docker compose
-    parser.add_argument('--target_device', default='CPU',
-                        help='desired running platform [cpu|core|xeon|dgpu.x]')
+    try:
+        default_target_device = resolve_target_device_default('CPU')
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+    parser.add_argument('--target_device', default=default_target_device,
+                        type=validate_target_device,
+                        help='desired running platform [CPU|GPU|GPU.<index>|NPU]')
     parser.add_argument('--compose_file', default=None, action='append',
                         help='path to docker compose files. ' +
                              'can be used multiple times')

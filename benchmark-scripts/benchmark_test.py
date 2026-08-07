@@ -55,6 +55,5 @@ class Testing(unittest.TestCase):
         mock_popen.communicate.assert_called_once_with()
         mock_returncode.assert_called()
 
-
 if __name__ == '__main__':
     unittest.main()
